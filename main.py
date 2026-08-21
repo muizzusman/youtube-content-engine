@@ -7,7 +7,6 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 import json
 from pathlib import Path
 from youtube.analysis import compute_all_metrics
-from youtube.database import get_all_videos
 from youtube.concepts import analyze_all_concepts
 from youtube.patterns import detect_cross_channel_patterns
 from youtube.llm import get_client as get_llm_client
@@ -276,16 +275,6 @@ def main():
         prune_old_snapshots(connection)
         vacuum_database(connection)
 
-        # stored_videos already carries concept fields from concept_json, if present
-        stored_videos = get_all_videos(connection)
-
-        # stored_videos already carries concept fields from concept_json, if present
-        analyzed_lookup = {
-            v["video_id"]: v
-            for v in stored_videos
-            if v.get("topic") is not None
-        }
-
         # Score only the current run's videos — historical videos would
         # otherwise skew min-max normalization (old viral videos keep a
         # high baseline_ratio forever while their velocity decays).
@@ -302,18 +291,9 @@ def main():
         print()
         print("Running concept analysis (this may take a minute)...")
 
-        videos_needing_analysis = [m for m in metrics if m["video_id"] not in analyzed_lookup]
-        already_analyzed = [
-            {**m, **analyzed_lookup[m["video_id"]]}
-            for m in metrics
-            if m["video_id"] in analyzed_lookup
-        ]
-
-        print(f"{len(videos_needing_analysis)} videos need analysis, {len(already_analyzed)} already cached")
-
-        newly_analyzed = analyze_all_concepts(llm_client, connection, videos_needing_analysis)
-
-        metrics = already_analyzed + newly_analyzed
+        print()
+        print("Running concept analysis (this may take a minute)...")
+        metrics = analyze_all_concepts(llm_client, connection, metrics)
 
         print("Detecting cross-channel patterns...")
         patterns = detect_cross_channel_patterns(llm_client, metrics)
