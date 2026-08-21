@@ -1,10 +1,29 @@
 import sqlite3
 from pathlib import Path
+import json
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATABASE_PATH = DATA_DIR / "youtube.db"
+
+def save_concept_results(
+    connection,
+    results_by_id: dict,
+) -> None:
+    """
+    Persists the actual concept analysis fields (topic, hook, etc.)
+    as JSON per video, so future runs can skip re-analyzing and
+    still have the real data available.
+    """
+
+    for video_id, fields in results_by_id.items():
+        connection.execute(
+            "UPDATE videos SET concept_json = ? WHERE video_id = ?",
+            (json.dumps(fields), video_id),
+        )
+
+    connection.commit()
 
 
 def get_connection() -> sqlite3.Connection:
@@ -160,12 +179,65 @@ def get_all_videos(
             duration_seconds,
             format,
             thumbnail_url,
-            video_url
+            video_url,
+            concept_json
         FROM videos
         """
     ).fetchall()
 
-    return [dict(row) for row in rows]
+    videos = []
+
+    for row in rows:
+        video = dict(row)
+
+        concept_json = video.pop("concept_json", None)
+
+        if concept_json:
+            try:
+                concept_fields = json.loads(concept_json)
+                video.update(concept_fields)
+            except json.JSONDecodeError:
+                pass  # corrupted/old data, treat as not analyzed
+
+        videos.append(video)
+
+    return videos
+
+def prune_old_snapshots(
+    connection: sqlite3.Connection,
+    days: int = 30,
+) -> None:
+    """
+    Deletes snapshot rows older than `days`, keeping the
+    time-series table from growing unbounded.
+    """
+
+    connection.execute(
+        """
+        DELETE FROM snapshots
+        WHERE checked_at < datetime('now', ?)
+        """,
+        (f"-{days} days",),
+    )
+
+    connection.commit()
+
+
+def vacuum_database(
+    connection: sqlite3.Connection,
+) -> None:
+    """
+    Rebuilds the database file to reclaim space freed by pruned
+    snapshot rows (SQLite never shrinks a file on its own, and
+    deleted-row pages keep getting committed to git otherwise).
+
+    Must run outside any open transaction, hence the commit first.
+    """
+
+    connection.commit()
+
+    connection.execute("VACUUM")
+
 
 def close_connection(
     connection: sqlite3.Connection,

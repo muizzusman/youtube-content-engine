@@ -17,6 +17,50 @@ def normalize_min_max(values: list[float]) -> list[float]:
     return [(v - lo) / (hi - lo) for v in values]
 
 
+def _quantile(ordered: list[float], q: float) -> float:
+    """Linear-interpolated quantile of an already-sorted list."""
+
+    position = q * (len(ordered) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = position - lower_index
+
+    return (
+        ordered[lower_index] * (1 - fraction)
+        + ordered[upper_index] * fraction
+    )
+
+
+def clip_outliers(values: list[float], k: float = 1.5) -> list[float]:
+    """
+    Clips values to Tukey fences ([Q1 - k·IQR, Q3 + k·IQR]) before
+    normalization, so one extreme outlier (e.g. a single 30x
+    baseline_ratio) doesn't compress every other video's normalized
+    score into a narrow band.
+
+    Unlike fixed-percentile clipping, Tukey fences leave well-behaved
+    data completely untouched regardless of run size — only genuine
+    outliers are pulled in.
+    """
+
+    if len(values) < 4:
+        return list(values)
+
+    ordered = sorted(values)
+
+    q1 = _quantile(ordered, 0.25)
+    q3 = _quantile(ordered, 0.75)
+    iqr = q3 - q1
+
+    if iqr == 0:
+        return list(values)
+
+    lo = q1 - k * iqr
+    hi = q3 + k * iqr
+
+    return [min(max(v, lo), hi) for v in values]
+
+
 def compute_breakout_scores(metrics: list[dict]) -> list[dict]:
     """
     Takes the list of metric dicts from analysis.py and attaches
@@ -27,9 +71,9 @@ def compute_breakout_scores(metrics: list[dict]) -> list[dict]:
     if not metrics:
         return metrics
 
-    baseline_values = [m["baseline_ratio"] for m in metrics]
-    velocity_values = [m["view_velocity"] for m in metrics]
-    engagement_values = [m["engagement_rate"] for m in metrics]
+    baseline_values = clip_outliers([m["baseline_ratio"] for m in metrics])
+    velocity_values = clip_outliers([m["view_velocity"] for m in metrics])
+    engagement_values = clip_outliers([m["engagement_rate"] for m in metrics])
 
     baseline_norm = normalize_min_max(baseline_values)
     velocity_norm = normalize_min_max(velocity_values)
@@ -54,10 +98,14 @@ def compute_breakout_scores(metrics: list[dict]) -> list[dict]:
     return metrics
 
 
-def select_performance_winner(metrics: list[dict]) -> dict:
+def select_performance_winner(metrics: list[dict]) -> dict | None:
     """
-    The video with the single highest breakout_score.
+    The video with the single highest breakout_score,
+    or None if there are no metrics at all.
     """
+
+    if not metrics:
+        return None
 
     return max(metrics, key=lambda m: m["breakout_score"])
 
@@ -65,18 +113,29 @@ def select_performance_winner(metrics: list[dict]) -> dict:
 def select_opportunity_winner(
     metrics: list[dict],
     exclude_video_id: str,
-) -> dict:
+) -> dict | None:
+    """
+    Most replicable concept among the non-winner videos.
+    Falls back to highest engagement when no video has a
+    replicability score. Returns None if the performance
+    winner is the only candidate.
+    """
+
     candidates = [
         m for m in metrics
         if m["video_id"] != exclude_video_id
         and m.get("replicability") is not None
     ]
 
-    if not candidates:
-        candidates = [m for m in metrics if m["video_id"] != exclude_video_id]
-        return max(candidates, key=lambda m: m["engagement_norm"])
+    if candidates:
+        return max(
+            candidates,
+            key=lambda m: (m["replicability"], m["engagement_norm"]),
+        )
 
-    return max(
-        candidates,
-        key=lambda m: (m["replicability"], m["engagement_norm"]),
-    )
+    fallback = [m for m in metrics if m["video_id"] != exclude_video_id]
+
+    if not fallback:
+        return None
+
+    return max(fallback, key=lambda m: m["engagement_norm"])

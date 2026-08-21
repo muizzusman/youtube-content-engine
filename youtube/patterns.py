@@ -1,8 +1,8 @@
-from youtube.llm import ask_json_resilient
+from youtube.llm import BULK_MODELS, ask_json_resilient
 
-PATTERN_SYSTEM_PROMPT = """
+PATTERN_SYSTEM_PROMPT_TEMPLATE = """
 You are a YouTube trend analyst. You will receive a list of video titles
-and topics from 5 different channels.
+and topics from {channel_count} different channels.
 
 Identify recurring patterns that appear independently across MULTIPLE
 different channels — not patterns that only repeat within one channel.
@@ -32,11 +32,20 @@ def build_patterns_prompt(metrics: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def build_patterns_system_prompt(metrics: list[dict]) -> str:
+    channel_count = len({m["channel_name"] for m in metrics})
+
+    return PATTERN_SYSTEM_PROMPT_TEMPLATE.format(
+        channel_count=channel_count,
+    )
+
+
 def detect_cross_channel_patterns(client, metrics: list[dict]) -> list[dict]:
     result = ask_json_resilient(
         client,
-        system_prompt=PATTERN_SYSTEM_PROMPT,
+        system_prompt=build_patterns_system_prompt(metrics),
         user_prompt=build_patterns_prompt(metrics),
+        models=BULK_MODELS,
     )
 
     return result.get("patterns", [])

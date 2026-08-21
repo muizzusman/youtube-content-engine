@@ -1,6 +1,7 @@
 import time
 
-from youtube.llm import ask_json_resilient
+from youtube.database import save_concept_results
+from youtube.llm import BULK_MODELS, ask_json_resilient
 
 BATCH_SYSTEM_PROMPT = """
 You are a YouTube content strategist analyzing video titles and metadata.
@@ -47,6 +48,7 @@ def analyze_batch(client, videos: list[dict]) -> dict:
         client,
         system_prompt=BATCH_SYSTEM_PROMPT,
         user_prompt=build_batch_prompt(videos),
+        models=BULK_MODELS,
     )
 
     by_id = {}
@@ -61,13 +63,17 @@ def analyze_batch(client, videos: list[dict]) -> dict:
 
 def analyze_all_concepts(
     client,
+    connection,
     metrics: list[dict],
-    batch_size: int = 8,
+    batch_size: int = 25,
 ) -> list[dict]:
     """
-    Main entry point for Stage 6 concept analysis, now batched.
-    Processes `batch_size` videos per LLM call instead of one call
-    per video, drastically cutting total API calls.
+    Main entry point for Stage 6 concept analysis, batched, with
+    caching: only analyzes videos that haven't been analyzed before.
+
+    Batches are deliberately large: free-tier limits are request-count
+    based, and 25 short title lines fit comfortably in one prompt, so
+    50 videos cost 2 requests instead of 7.
     """
 
     results_by_id: dict = {}
@@ -82,12 +88,13 @@ def analyze_all_concepts(
         try:
             batch_results = analyze_batch(client, batch)
             results_by_id.update(batch_results)
+            save_concept_results(connection, batch_results)
+
         except Exception as error:
             print(f"    [batch {batch_num} failed]: {error}")
-            # videos in this batch simply won't get concept fields
 
         if batch_num < total_batches:
-            time.sleep(3)  # small gap between batches; header-based pacing in llm.py handles the rest
+            time.sleep(3)
 
     enriched = []
 

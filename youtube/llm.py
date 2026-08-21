@@ -2,148 +2,120 @@ import json
 import os
 import time
 
-from groq import Groq, RateLimitError
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError, ClientError
 
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+# Title generation runs at most twice per run, so it leads with the
+# strongest model and treats quality as the priority.
+CREATIVE_MODELS = [
+    "models/gemini-3.7-flash",  # newest, most capable Flash
+    "models/gemini-2.5-flash",  # older, well-established free tier
+]
+
+# Concept extraction and pattern detection issue many calls per run, so
+# they lead with lightweight variants that carry higher free-tier daily
+# quotas, keeping the flagship model off the hot path.
+BULK_MODELS = [
+    "models/gemini-3.5-flash-lite",  # newest lightweight, high free-tier quota
+    "models/gemini-3.1-flash-lite",  # lightweight, well-established
+    "models/gemini-2.5-flash-lite",  # older lightweight safety net
+    "models/gemini-2.5-flash",       # mid-tier fallback
+    "models/gemini-3.7-flash",       # last resort
+]
+
+RATE_LIMIT_WAIT_SECONDS = 10
 
 
-def get_client() -> Groq:
-    api_key = os.getenv("GROQ_API_KEY")
+def get_client() -> genai.Client:
+    api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY is missing from the environment.")
+        raise RuntimeError("GEMINI_API_KEY is missing from the environment.")
 
-    return Groq(api_key=api_key)
-
-
-def _parse_reset_value(value: str) -> float:
-    value = (value or "").strip()
-    total = 0.0
-    num = ""
-
-    for ch in value:
-        if ch.isdigit() or ch == ".":
-            num += ch
-        elif ch == "m":
-            total += float(num or 0) * 60
-            num = ""
-        elif ch == "s":
-            total += float(num or 0)
-            num = ""
-
-    return total
-
-
-def _proactive_pace(headers) -> None:
-    try:
-        remaining_tokens = int(headers.get("x-ratelimit-remaining-tokens", 999999))
-        remaining_requests = int(headers.get("x-ratelimit-remaining-requests", 999999))
-
-        reset_tokens = headers.get("x-ratelimit-reset-tokens")
-        reset_requests = headers.get("x-ratelimit-reset-requests")
-
-        if remaining_tokens < 1500 and reset_tokens:
-            wait = _parse_reset_value(reset_tokens)
-            if wait > 0:
-                print(f"    [pacing] {remaining_tokens} tokens left, waiting {wait:.1f}s")
-                time.sleep(wait)
-                return
-
-        if remaining_requests < 3 and reset_requests:
-            wait = _parse_reset_value(reset_requests)
-            if wait > 0:
-                print(f"    [pacing] {remaining_requests} requests left, waiting {wait:.1f}s")
-                time.sleep(wait)
-
-    except Exception:
-        pass
+    return genai.Client(api_key=api_key)
 
 
 def ask_json(
-    client: Groq,
+    client: genai.Client,
     system_prompt: str,
     user_prompt: str,
-    model: str = DEFAULT_MODEL,
-    max_retries: int = 6,
+    model: str = CREATIVE_MODELS[0],
+    max_retries: int = 2,
 ) -> dict:
     last_error = None
 
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
-            raw = client.chat.completions.with_raw_response.create(
+            response = client.models.generate_content(
                 model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.4,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    response_mime_type="application/json",
+                    temperature=0.4,
+                ),
             )
 
-            completion = raw.parse()
-            content = completion.choices[0].message.content
-
-            _proactive_pace(raw.headers)
-
             try:
-                return json.loads(content)
+                return json.loads(response.text)
             except json.JSONDecodeError as error:
                 raise ValueError(
-                    f"Model did not return valid JSON:\n{content}"
+                    f"Model did not return valid JSON:\n{response.text}"
                 ) from error
 
-        except RateLimitError as error:
+        # Fix: Catch generic APIError alongside ClientError for better safety
+        except (ClientError, APIError) as error:
             last_error = error
-            wait_time = 15
 
-            try:
-                wait_time = float(
-                    error.response.headers.get("retry-after", wait_time)
+            # google-genai errors expose the HTTP status as an int on .code;
+            # RESOURCE_EXHAUSTED covers gRPC-style messages without a code.
+            status_code = getattr(error, "code", None)
+            is_rate_limited = (
+                status_code == 429
+                or "RESOURCE_EXHAUSTED" in str(error)
+            )
+
+            # Structural errors (403/404) bubble up immediately so the
+            # caller can fall through to the next model. On rate limits,
+            # retry once with a short wait, then give up on this model —
+            # long per-model waits only burn wall time when the daily
+            # quota (not the per-minute window) is exhausted.
+            if not is_rate_limited:
+                raise
+
+            if attempt < max_retries:
+                print(
+                    f"    Rate limited on {model}, retrying in "
+                    f"{RATE_LIMIT_WAIT_SECONDS}s "
+                    f"(attempt {attempt}/{max_retries})..."
                 )
-            except Exception:
-                pass
-
-            print(f"    Rate limited on {model}, waiting {wait_time:.1f}s (attempt {attempt + 1}/{max_retries})...")
-            time.sleep(wait_time + 1)
+                time.sleep(RATE_LIMIT_WAIT_SECONDS)
 
     raise RuntimeError(
-        f"Failed after {max_retries} retries on {model}: {last_error}"
+        f"Rate limited on {model} after {max_retries} attempts: {last_error}"
     )
 
-FALLBACK_MODELS = [
-    "openai/gpt-oss-120b",
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-20b",
-    "llama-3.1-8b-instant",
-]
 
 def ask_json_resilient(
-    client: Groq,
+    client: genai.Client,
     system_prompt: str,
     user_prompt: str,
     models: list[str] = None,
 ) -> dict:
-    """
-    Tries each model in order. If one is fully exhausted (all retries
-    within ask_json failed), moves to the next model instead of giving
-    up entirely. This spreads load across separate rate-limit pools,
-    since Groq's limits apply per-model, not per-account.
-    """
-
-    models = models or FALLBACK_MODELS
+    # Creative calls (titles) default to the quality-first chain; bulk
+    # callers pass BULK_MODELS explicitly.
+    models = models or CREATIVE_MODELS
     last_error = None
 
     for model in models:
         try:
-            return ask_json(
-                client,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model=model,
-            )
-        except RuntimeError as error:
+            return ask_json(client, system_prompt, user_prompt, model=model)
+        # Fix: Catch both RuntimeError and ClientError so invalid model names 
+        # or auth errors don't instantly kill the script before checking fallbacks
+        except (RuntimeError, ClientError, APIError) as error:
             last_error = error
-            print(f"    [{model} exhausted, falling back to next model]")
+            print(f"    [{model} failed or exhausted, falling back to next model]")
             continue
 
     raise RuntimeError(

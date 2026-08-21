@@ -1,9 +1,18 @@
 import os
+import time
 from typing import Any
 
 import requests
 
 BASE_URL = "https://www.googleapis.com/youtube/v3"
+
+# Transient failures worth retrying: rate limiting + server-side errors.
+# Client errors like 400/403 indicate a bad request or key and are
+# raised immediately.
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+MAX_ATTEMPTS = 4
+BASE_DELAY_SECONDS = 2.0
 
 class YouTubeAPIError(RuntimeError):
     """Raised when the YouTube API returns an error."""
@@ -31,24 +40,55 @@ class YouTubeClient:
 
         url = f"{BASE_URL}/{endpoint}"
 
-        response = self.session.get(
-            url,
-            params=params,
-            timeout=30,
-        )
+        last_error: Exception | None = None
+        retry_after: str | None = None
 
-        if not response.ok:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            retry_after = None
+
             try:
-                error_data = response.json()
-            except ValueError:
-                error_data = response.text
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=30,
+                )
+            except requests.RequestException as error:
+                last_error = YouTubeAPIError(
+                    f"Network error calling {endpoint}: {error}"
+                )
+            else:
+                if response.ok:
+                    return response.json()
 
-            raise YouTubeAPIError(
-                f"YouTube API request failed "
-                f"({response.status_code}): {error_data}"
-            )
+                try:
+                    error_data = response.json()
+                except ValueError:
+                    error_data = response.text
 
-        return response.json()
+                last_error = YouTubeAPIError(
+                    f"YouTube API request failed "
+                    f"({response.status_code}): {error_data}"
+                )
+
+                if response.status_code not in RETRYABLE_STATUS_CODES:
+                    raise last_error
+
+                # Honor the server's own backoff hint when present
+                retry_after = response.headers.get("Retry-After")
+
+            if attempt < MAX_ATTEMPTS:
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+
+                print(
+                    f"    {endpoint} failed, retrying in {delay:.0f}s "
+                    f"(attempt {attempt}/{MAX_ATTEMPTS})..."
+                )
+                time.sleep(delay)
+
+        raise last_error
 
     def get_channel_by_handle(self, handle: str) -> dict[str, Any]:
         return self.get(
