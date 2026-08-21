@@ -65,7 +65,7 @@ def analyze_all_concepts(
     client,
     connection,
     metrics: list[dict],
-    batch_size: int = 25,
+    batch_size: int = 8,
 ) -> list[dict]:
     """
     Main entry point for Stage 6 concept analysis, batched, with
