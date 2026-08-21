@@ -10,7 +10,7 @@ from google.genai.errors import APIError, ClientError
 # strongest model and treats quality as the priority.
 CREATIVE_MODELS = [
     "models/gemini-3.7-flash",  # newest, most capable Flash
-    "models/gemini-2.5-flash",  # older, well-established free tier
+    "models/gemini-3.6-flash",  # well-established, replaces deprecated 2.5-flash
 ]
 
 # Concept extraction and pattern detection issue many calls per run, so
@@ -20,7 +20,7 @@ BULK_MODELS = [
     "models/gemini-3.5-flash-lite",  # newest lightweight, high free-tier quota
     "models/gemini-3.1-flash-lite",  # lightweight, well-established
     "models/gemini-2.5-flash-lite",  # older lightweight safety net
-    "models/gemini-2.5-flash",       # mid-tier fallback
+    "models/gemini-3.6-flash",       # mid-tier fallback
     "models/gemini-3.7-flash",       # last resort
 ]
 
