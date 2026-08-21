@@ -2,7 +2,7 @@ name: Daily YouTube Content Intelligence
 
 on:
   schedule:
-    - cron: "0 7 * * *"  # 7:00 AM UTC = 12:00 PM Lahore time
+    - cron: "2 0 * * *"  # 7:00 AM UTC = 12:00 PM Lahore time
   workflow_dispatch:  # allows manual trigger from GitHub's UI
 
 jobs:
