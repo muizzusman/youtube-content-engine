@@ -276,7 +276,7 @@ def main():
         prune_old_snapshots(connection)
         vacuum_database(connection)
 
-        # --- Stage 3: performance normalization ---
+        # stored_videos already carries concept fields from concept_json, if present
         stored_videos = get_all_videos(connection)
 
         # stored_videos already carries concept fields from concept_json, if present
