@@ -72,16 +72,18 @@ def create_trello_card(video: dict, label: str) -> dict:
 
 
 def push_winners_to_trello(
-    performance_winner: dict,
-    opportunity_winner: dict,
+    performance_winner: dict | None,
+    opportunity_winner: dict | None,
 ) -> None:
     print()
     print("Pushing winners to Trello...")
 
-    perf_card = create_trello_card(performance_winner, "PERFORMANCE WINNER")
-    print(f"  Created: {perf_card['name']}")
-    print(f"  {perf_card['shortUrl']}")
+    if performance_winner is not None:
+        perf_card = create_trello_card(performance_winner, "PERFORMANCE WINNER")
+        print(f"  Created: {perf_card['name']}")
+        print(f"  {perf_card['shortUrl']}")
 
-    opp_card = create_trello_card(opportunity_winner, "OPPORTUNITY WINNER")
-    print(f"  Created: {opp_card['name']}")
-    print(f"  {opp_card['shortUrl']}")
+    if opportunity_winner is not None:
+        opp_card = create_trello_card(opportunity_winner, "OPPORTUNITY WINNER")
+        print(f"  Created: {opp_card['name']}")
+        print(f"  {opp_card['shortUrl']}")

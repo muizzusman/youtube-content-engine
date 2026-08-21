@@ -1,6 +1,10 @@
 import statistics
 from datetime import datetime, timezone
 
+# Constant added to the engagement-rate denominator to dampen
+# inflated rates on very low-view videos (see compute_video_metrics).
+ENGAGEMENT_SMOOTHING_VIEWS = 100
+
 
 def get_latest_snapshot(
     connection,
@@ -74,9 +78,14 @@ def compute_video_metrics(
     subscriber_count = max(video["subscriber_count"], 1)
     subscriber_adjusted_reach = views / subscriber_count
 
+    # Laplace-style smoothing: a video with 12 views and 3 likes
+    # would otherwise post a 25% engagement rate and dominate the
+    # min-max normalization. Adding a constant to the denominator
+    # dampens rates for low-view videos while barely moving the
+    # needle for established ones.
     engagement_rate = (
-        (likes + comments) / views
-        if views > 0
+        (likes + comments) / (views + ENGAGEMENT_SMOOTHING_VIEWS)
+        if views >= 0
         else 0.0
     )
 
@@ -103,14 +112,24 @@ def attach_channel_baselines(metrics: list[dict]) -> list[dict]:
     median view count of *other videos from the same channel
     and same format* (Shorts compared to Shorts, long-form to
     long-form — never mixed).
+
+    If a channel has fewer than 2 videos in a format, fall back
+    to the median across all channels for that same format, so
+    baseline_ratio stays meaningful even with one video per
+    channel.
     """
 
     # Group view counts by (channel_id, format)
     groups: dict[tuple, list[int]] = {}
 
+    # Group view counts by format only (cross-channel fallback)
+    format_groups: dict[str, list[int]] = {}
+
     for item in metrics:
         key = (item["channel_id"], item["format"])
         groups.setdefault(key, []).append(item["views"])
+
+        format_groups.setdefault(item["format"], []).append(item["views"])
 
     for item in metrics:
         key = (item["channel_id"], item["format"])
@@ -118,6 +137,8 @@ def attach_channel_baselines(metrics: list[dict]) -> list[dict]:
 
         if len(group_views) >= 2:
             baseline = statistics.median(group_views)
+        elif len(format_groups[item["format"]]) >= 2:
+            baseline = statistics.median(format_groups[item["format"]])
         else:
             baseline = item["views"] or 1
 

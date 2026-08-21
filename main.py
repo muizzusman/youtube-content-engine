@@ -21,8 +21,10 @@ from youtube.database import (
     close_connection,
     get_connection,
     initialize_database,
+    prune_old_snapshots,
     save_snapshot,
     save_video,
+    vacuum_database,
 )
 from youtube.parser import (
     classify_format,
@@ -145,6 +147,16 @@ def process_channel(
             parse_iso_duration(duration)
         )
 
+        thumbnails = snippet.get(
+            "thumbnails",
+            {}
+        )
+
+        thumbnail = thumbnails.get(
+            "high",
+            {}
+        )
+
         video_data = {
             "video_id": video_id,
 
@@ -174,14 +186,15 @@ def process_channel(
 
             "format":
                 classify_format(
-                    duration_seconds
+                    duration_seconds,
+                    thumbnail_width=thumbnail.get("width"),
+                    thumbnail_height=thumbnail.get("height"),
+                    title=snippet.get("title", ""),
+                    description=snippet.get("description", ""),
                 ),
 
             "thumbnail_url":
-                snippet
-                .get("thumbnails", {})
-                .get("high", {})
-                .get("url"),
+                thumbnail.get("url"),
 
             "video_url":
                 f"https://www.youtube.com/watch?v={video_id}",
@@ -260,29 +273,71 @@ def main():
 
         connection.commit()
 
+        prune_old_snapshots(connection)
+        vacuum_database(connection)
+
         # --- Stage 3: performance normalization ---
         stored_videos = get_all_videos(connection)
-        metrics = compute_all_metrics(connection, stored_videos)
+
+        # stored_videos already carries concept fields from concept_json, if present
+        analyzed_lookup = {
+            v["video_id"]: v
+            for v in stored_videos
+            if v.get("topic") is not None
+        }
+
+        # Score only the current run's videos — historical videos would
+        # otherwise skew min-max normalization (old viral videos keep a
+        # high baseline_ratio forever while their velocity decays).
+        metrics = compute_all_metrics(connection, all_videos)
+
+        if not metrics:
+            print()
+            print("No videos with snapshot data — nothing to score.")
+            return
+
         metrics = compute_breakout_scores(metrics)
         llm_client = get_llm_client()
 
         print()
         print("Running concept analysis (this may take a minute)...")
-        metrics = analyze_all_concepts(llm_client, metrics)    
+
+        videos_needing_analysis = [m for m in metrics if m["video_id"] not in analyzed_lookup]
+        already_analyzed = [
+            {**m, **analyzed_lookup[m["video_id"]]}
+            for m in metrics
+            if m["video_id"] in analyzed_lookup
+        ]
+
+        print(f"{len(videos_needing_analysis)} videos need analysis, {len(already_analyzed)} already cached")
+
+        newly_analyzed = analyze_all_concepts(llm_client, connection, videos_needing_analysis)
+
+        metrics = already_analyzed + newly_analyzed
 
         print("Detecting cross-channel patterns...")
         patterns = detect_cross_channel_patterns(llm_client, metrics)
 
         performance_winner = select_performance_winner(metrics)
+
+        if performance_winner is None:
+            print()
+            print("No winner could be selected — nothing to deliver.")
+            return
+
         opportunity_winner = select_opportunity_winner(
             metrics,
-            exclude_video_id=performance_winner["video_id"]
-            )
+            exclude_video_id=performance_winner["video_id"],
+        )
+
         print()
         print("Generating optimized titles...")
 
         performance_winner = generate_optimized_title(llm_client, performance_winner)
-        opportunity_winner = generate_optimized_title(llm_client, opportunity_winner)
+
+        if opportunity_winner is not None:
+            opportunity_winner = generate_optimized_title(llm_client, opportunity_winner)
+
         push_winners_to_trello(performance_winner, opportunity_winner)
 
         print()
@@ -317,16 +372,17 @@ def main():
         print(f"  Technique: {performance_winner['technique_used']}")
         print(f"  Why: {performance_winner['title_rationale']}")
 
-        print()
-        print("=" * 100)
-        print("OPPORTUNITY WINNER")
-        print("=" * 100)
-        print(f"{opportunity_winner['channel_name']} | {opportunity_winner['title']}")
-        print(f"Replicability: {opportunity_winner.get('replicability')}/10 | Engagement: {opportunity_winner['engagement_rate']*100:.2f}% | {opportunity_winner['video_url']}")
-        print()
-        print(f"  Optimized title: {opportunity_winner['optimized_title']}")
-        print(f"  Technique: {opportunity_winner['technique_used']}")
-        print(f"  Why: {opportunity_winner['title_rationale']}")
+        if opportunity_winner is not None:
+            print()
+            print("=" * 100)
+            print("OPPORTUNITY WINNER")
+            print("=" * 100)
+            print(f"{opportunity_winner['channel_name']} | {opportunity_winner['title']}")
+            print(f"Replicability: {opportunity_winner.get('replicability')}/10 | Engagement: {opportunity_winner['engagement_rate']*100:.2f}% | {opportunity_winner['video_url']}")
+            print()
+            print(f"  Optimized title: {opportunity_winner['optimized_title']}")
+            print(f"  Technique: {opportunity_winner['technique_used']}")
+            print(f"  Why: {opportunity_winner['title_rationale']}")
 
         print()
         print("=" * 100)
@@ -340,8 +396,8 @@ def main():
                 print(f"\n[{p['strength'].upper()}] {p['pattern_name']}")
                 print(f"  {p['description']}")
                 print(f"  Channels: {', '.join(p['channels_involved'])}")
-            for example in p.get('example_titles', []):
-                print(f"    - {example}")
+                for example in p.get('example_titles', []):
+                    print(f"    - {example}")
 
     finally:
         close_connection(connection)

@@ -50,16 +50,53 @@ def parse_iso_duration(
         + seconds
     )
 
+SHORTS_MAX_SECONDS = 180
+
+
 def classify_format(
     duration_seconds: int,
+    thumbnail_width: int | None = None,
+    thumbnail_height: int | None = None,
+    title: str = "",
+    description: str = "",
 ) -> str:
     """
-    Initial practical classifier.
+    Classify a video as "short" or "long" using every signal the
+    Data API gives us, since there is no `is_short` field:
 
-    We will improve Shorts detection later.
+    1. Duration — Shorts are capped at 3 minutes (180s), so anything
+       longer can never be a Short.
+    2. Aspect ratio — Shorts are vertical (or square). A landscape
+       video is a regular upload even if it's under 3 minutes, so
+       it does not belong in the Shorts baseline group.
+    3. Hashtag — creators often tag #shorts / #short explicitly.
+
+    If thumbnail dimensions are unavailable we fall back to the old
+    duration-only behavior so classification never gets worse.
     """
 
-    if duration_seconds <= 180:
+    if duration_seconds > SHORTS_MAX_SECONDS:
+        return "long"
+
+    text = f"{title} {description}".lower()
+
+    if "#shorts" in text or "#short" in text:
+        return "short"
+
+    has_dimensions = (
+        thumbnail_width is not None
+        and thumbnail_height is not None
+        and thumbnail_width > 0
+        and thumbnail_height > 0
+    )
+
+    if not has_dimensions:
+        # No aspect-ratio signal: keep legacy duration-only result
+        return "short"
+
+    # Vertical (h > w) or square (h == w) thumbnails indicate a
+    # Short; landscape means it's just a short regular video.
+    if thumbnail_height >= thumbnail_width:
         return "short"
 
     return "long"
