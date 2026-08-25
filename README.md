@@ -5,84 +5,82 @@
 <!-- TODO(you): record a 30-60s terminal capture of a full run (python main.py),
      convert to GIF, save as docs/demo.gif, then delete this comment and add: ![Terminal run](docs/demo.gif) -->
 
-<!-- TODO(you): screenshot your Trello board showing the two winner cards,
-     save as docs/trello.png, then delete this comment and add: ![Trello winner cards](docs/trello.png) -->
+<!-- TODO(you): screenshot your Trello board showing the winner card,
+     save as docs/trello.png, then delete this comment and add: ![Trello winner card](docs/trello.png) -->
 
-Daily automated pipeline that monitors competitor gaming channels on YouTube,
-scores their video performance, and uses an LLM to reverse-engineer *why* the
-winners work — then generates optimized title ideas and delivers them to a
-Trello board as ready-to-use content concepts.
+Daily automated pipeline that races the latest uploads from competitor gaming
+channels against each other, crowns the one that overperformed relative to its
+audience size, uses an LLM to reverse-engineer *why* it works — then generates
+an optimized title and delivers it to a Trello board as a ready-to-use content
+concept.
 
 ## How it works
 
 ```
-YouTube Data API v3 ──► SQLite ──► Normalized metrics ──► Gemini LLM ──► Trello cards
- (latest uploads from    (videos,   (velocity, engagement,  (concepts,   (performance +
-  N gaming channels)     snapshots) baseline ratio)          patterns,    opportunity
-                                                             titles)      winners)
+YouTube Data API v3 ───> Velocity ranking ───> Gemini LLM ───> Trello card
+ (latest upload from     (views/hour per       (concept +      (performance
+  each tracked channel)   million subs)         title)          winner)
 ```
 
 | Stage | Modules | What it does |
 |---|---|---|
-| 1. Ingest | `youtube/videos.py`, `channels.py`, `parser.py` | Resolve @handles, fetch latest uploads, parse durations, classify short/long (duration + aspect ratio + #shorts tag) |
-| 2. Store | `youtube/database.py` | Upsert videos, append a stats snapshot per run (time-series) |
-| 3. Score | `youtube/analysis.py`, `scoring.py` | View velocity, engagement rate, per-channel/format baselines → breakout score |
-| 4. Analyze | `youtube/llm.py`, `concepts.py`, `patterns.py`, `titles.py` | Concept extraction, cross-channel pattern detection, optimized title rewriting |
-| 5. Deliver | `youtube/trello.py` | Push Performance Winner + Opportunity Winner cards |
+| 1. Ingest | `youtube/videos.py`, `channels.py`, `parser.py` | Resolve @handles, fetch **only the latest upload** per channel, parse durations, classify short/long (duration + aspect ratio + #shorts tag) |
+| 2. Score | `main.py`, `youtube/analysis.py` | Views-per-hour since publish, normalized by subscriber count → velocity index; rank fresh every run (no database) |
+| 3. Analyze | `youtube/llm.py`, `concepts.py`, `titles.py` | Concept extraction + optimized title rewriting for **the winner only** (2 LLM calls total) |
+| 4. Deliver | `youtube/trello.py` | Push Performance Winner card |
+
+Stateless by design: nothing is stored between runs. Every run compares the
+current latest uploads from scratch.
 
 ## Scoring
 
-Each metric is min-max normalized across the current run, then blended:
+Each video's latest-upload performance is measured as:
 
 ```
-breakout_score = 0.45 · baseline_ratio_norm
-               + 0.35 · view_velocity_norm
-               + 0.20 · engagement_rate_norm
+view_velocity   = views / hours_since_publish          (raw momentum)
+velocity_index  = view_velocity / subscribers × 1e6    (ranking metric)
 ```
 
-- **baseline_ratio** — views ÷ median views of the same channel *and same format*
-  (Shorts never compete with long-form). If a channel has only one video in a
-  format, the median across all channels for that format is used instead
-- **view_velocity** — views per hour since publish
-- **engagement_rate** — (likes + comments) ÷ (views + 100). The constant in
-  the denominator dampens inflated rates on very low-view videos
+`velocity_index` reads as *views per hour per million subscribers*. Ranking on
+the subscriber-adjusted figure means a 300K-sub channel can legitimately beat
+a 4M-sub channel — it measures overperformance relative to audience size,
+not raw reach.
 
-Before blending, each metric series has outliers clipped to Tukey fences
-(Q1 − 1.5·IQR … Q3 + 1.5·IQR), so a single extreme result can't compress
-everyone else's normalized scores. Well-behaved data is left untouched.
+Details that keep comparisons honest:
 
-Scores are computed per run over that run's videos only, so historical
-videos don't skew the normalization.
+- Videos younger than 30 minutes are scored as if exactly 30 minutes old, so
+  brand-new uploads don't post absurd near-infinite velocities.
+- If a channel's latest upload is a **Short**, it stays in the ranking but is
+  flagged in the output — Shorts accumulate views far faster than long-form,
+  so a Short winning the index should be read with that skew in mind.
+- A channel whose fetch fails is skipped with a warning instead of killing
+  the run; the race continues with the remaining channels.
 
-Two winners are selected each run:
+The highest velocity index wins. One **Performance Winner** is pushed to
+Trello each run.
 
-- **Performance Winner** — highest breakout score
-- **Opportunity Winner** — most replicable concept (LLM-scored 1–10) among the rest
+A YouTube API run costs ~7 quota units (5 channel lookups + 1 playlist call +
+1 batched videos call).
 
 ## Project structure
 
 ```
 ├── main.py                          # pipeline entrypoint
-├── config.json                      # channels to track + videos per channel
+├── config.json                      # channels to track
 ├── test_llm.py                      # manual smoke test (lists available models)
 ├── requirements.txt
 ├── .env.example                     # copy to .env and fill in your keys
 ├── .github/
-│   └── workflows/run_daily.yml      # daily scheduled run (GitHub Actions)
-├── data/                            # sqlite db (gitignored locally; CI force-commits it)
-├── logs/                            # run logs (gitignored)
+│   └── workflows/daily.yml          # daily scheduled run (GitHub Actions)
 └── youtube/
-    ├── videos.py         # YouTube Data API v3 client
+    ├── videos.py         # YouTube Data API v3 client (retries w/ backoff)
     ├── channels.py       # handle → channel resolution
     ├── parser.py         # ISO-8601 duration parsing, format classification
-    ├── database.py       # sqlite schema + queries + snapshot pruning
-    ├── analysis.py       # per-video metrics, channel baselines
-    ├── scoring.py        # normalization, breakout score, winner selection
+    ├── analysis.py       # time-since-publish helper
     ├── llm.py            # Gemini client (JSON mode, model fallback, retries)
-    ├── concepts.py       # per-video concept extraction (batched, cached)
-    ├── patterns.py       # cross-channel pattern detection
+    ├── concepts.py       # concept extraction (single batched request)
     ├── titles.py         # optimized title generation
-    └── trello.py         # winner cards
+    └── trello.py         # winner card
 ```
 
 ## Getting started
@@ -91,7 +89,7 @@ Two winners are selected each run:
 
 - Python 3.10+
 - A [YouTube Data API v3](https://console.cloud.google.com/) key — a full run
-  uses ~15 quota units of the free 10k/day
+  uses ~7 quota units of the free 10k/day
 - A [Google AI Studio (Gemini)](https://aistudio.google.com/apikey) API key
   (free tier available)
 - [Trello API key + token](https://trello.com/power-ups/admin) and the ID of
@@ -138,16 +136,14 @@ Then edit `config.json`:
     "channels": [
         "https://www.youtube.com/@somechannel",
         "https://www.youtube.com/@anotherchannel"
-    ],
-    "videos_per_channel": 10
+    ]
 }
 ```
 
-LLM calls are tiered: bulk work (concept extraction, pattern detection)
-runs on lightweight flash-lite variants with higher free-tier daily
-quotas, while title generation uses the strongest Flash model. Both
-fall back through older variants on rate limits — see `CREATIVE_MODELS`
-and `BULK_MODELS` in `youtube/llm.py`.
+LLM calls are tiered: concept extraction runs on lightweight flash-lite
+variants with higher free-tier daily quotas, while title generation uses the
+strongest Flash model. Both fall back through older variants on rate limits —
+see `CREATIVE_MODELS` and `BULK_MODELS` in `youtube/llm.py`.
 
 ### 3. Run
 
@@ -162,50 +158,38 @@ Sample output:
 Channel: https://www.youtube.com/@gameranxTV
 Name: gameranx
 Subscribers: 7,800,000
-[long ]      1,204,551 views | 10 Games That ...
+[long ]        481,203 views | 10 Games That ...
+
+====================================================================================================
+LATEST-UPLOAD VELOCITY RANKING (views per hour per million subscribers)
+====================================================================================================
+1. Some Channel (312,000 subs)
+       84,112 views in    26.4 h  |  3,185.6 views/hr raw  |  index 10210.00
+   This Game Is a Masterpiece...
 
 ====================================================================================================
 PERFORMANCE WINNER
 ====================================================================================================
-IGN | Marvel's Wolverine - Official Deluxe Edition Trailer
-Score: 0.7691 | https://www.youtube.com/watch?v=...
+Some Channel | This Game Is a Masterpiece...
+Velocity index: 10210.00 | 3,185.6 views/hr | 84,112 views in 26.4 h | https://www.youtube.com/watch?v=...
 
-  Optimized title: Never-Before-Seen Wolverine Fight Added to Deluxe Edition — First Look
+  Optimized title: The 40-Hour Detail Everyone Missed in This Game
   Technique: Specific Reveal
-  Why: Names a tangible addition so viewers know exactly what exclusive content they'll see.
-
-====================================================================================================
-CROSS-CHANNEL PATTERNS
-====================================================================================================
-[MODERATE] Leak/Accidental Reveal of Upcoming Game
-  Channels: Gwynblade, Inside Games
+  Why: Names a tangible detail so viewers know exactly what they'll discover.
 ```
 
 ### 4. Run daily (optional)
 
-A GitHub Actions workflow (`.github/workflows/run_daily.yml`) runs the
-pipeline every day at 20:00 UTC and commits `data/youtube.db` back to the
-repo so history accumulates between runs.
-
-To enable it, add these repository secrets (*Settings → Secrets and
-variables → Actions*):
+A GitHub Actions workflow (`.github/workflows/daily.yml`) runs the pipeline
+every day at 20:00 UTC. To enable it, add these repository secrets
+(*Settings → Secrets and variables → Actions*):
 
 `YOUTUBE_API_KEY`, `GEMINI_API_KEY`, `TRELLO_API_KEY`, `TRELLO_TOKEN`,
 `TRELLO_LIST_ID`
 
 You can also trigger a run manually from the *Actions* tab via
-*workflow_dispatch*. To run locally on a schedule instead, use Task
-Scheduler (Windows) or cron (macOS/Linux) to invoke `python main.py`
-periodically.
-
-## Data model
-
-Two tables in `data/youtube.db`:
-
-- `videos` — one row per video (upserted on every run), plus a `concept_json`
-  column caching LLM concept analysis so videos are only analyzed once
-- `snapshots` — views/likes/comments appended per run, enabling historical
-  trend tracking (rows older than 30 days are pruned each run)
+*workflow_dispatch*. To run locally on a schedule instead, use Task Scheduler
+(Windows) or cron (macOS/Linux) to invoke `python main.py` periodically.
 
 ## Limitations / roadmap
 
@@ -214,9 +198,11 @@ Two tables in `data/youtube.db`:
       `is_short` flag, so this remains a heuristic
 - [x] Retry with exponential backoff on transient YouTube Data API errors
       (429/5xx/network); non-retryable client errors fail fast
-- [ ] `data/youtube.db` committed by CI grows over time — snapshot pruning
-      plus a per-run `VACUUM` keep it compact for now; consider artifact
-      storage if it becomes a problem
+- [ ] Velocity measured from a single point in time is *average speed since
+      publish*, not current momentum — a video posted yesterday and one
+      posted an hour ago accrue views at different decay curves
+- [ ] Subscriber counts are rounded by YouTube above ~1K, so the index is
+      approximate for very large channels
 
 ## License
 

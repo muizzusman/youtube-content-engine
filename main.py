@@ -6,40 +6,28 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 import json
 from pathlib import Path
-from youtube.analysis import compute_all_metrics
-from youtube.concepts import analyze_all_concepts
-from youtube.patterns import detect_cross_channel_patterns
-from youtube.llm import get_client as get_llm_client
-from youtube.titles import generate_optimized_title
-from youtube.trello import push_winners_to_trello
 
 from dotenv import load_dotenv
 
+from youtube.analysis import hours_since_published
 from youtube.channels import get_channel_info
-from youtube.database import (
-    close_connection,
-    get_connection,
-    initialize_database,
-    prune_old_snapshots,
-    save_snapshot,
-    save_video,
-    vacuum_database,
-)
-from youtube.parser import (
-    classify_format,
-    parse_iso_duration,
-)
+from youtube.concepts import analyze_concepts
+from youtube.llm import get_client as get_llm_client
+from youtube.parser import classify_format, parse_iso_duration
+from youtube.titles import generate_optimized_title
+from youtube.trello import push_winner_to_trello
 from youtube.videos import YouTubeClient
-
-from youtube.scoring import (
-    compute_breakout_scores,
-    select_performance_winner,
-    select_opportunity_winner,
-)
 
 BASE_DIR = Path(__file__).resolve().parent
 
 CONFIG_PATH = BASE_DIR / "config.json"
+
+# Videos younger than this are treated as if exactly this old:
+# velocity in the first minutes is noise and would otherwise explode.
+MIN_AGE_HOURS = 0.5
+
+# velocity_index unit: views per hour per million subscribers.
+SUBSCRIBER_SCALE = 1_000_000
 
 
 def load_config() -> dict:
@@ -50,26 +38,23 @@ def load_config() -> dict:
         return json.load(file)
 
 
-def process_channel(
+def fetch_latest_upload(
     client: YouTubeClient,
-    connection,
     channel_url: str,
-    videos_per_channel: int,
-) -> list[dict]:
+) -> dict | None:
+    """
+    Resolve a channel URL to its single most recent upload with full
+    statistics, plus derived velocity metrics attached.
+
+    Returns None if the channel has no uploads.
+    """
+
+    channel = get_channel_info(client, channel_url)
 
     print()
     print("-" * 70)
     print(f"Channel: {channel_url}")
-
-    channel = get_channel_info(
-        client,
-        channel_url,
-    )
-
-    print(
-        f"Name: {channel['channel_name']}"
-    )
-
+    print(f"Name: {channel['channel_name']}")
     print(
         f"Subscribers: "
         f"{channel['subscriber_count']:,}"
@@ -77,175 +62,100 @@ def process_channel(
 
     uploads = client.get_uploads(
         channel["uploads_playlist_id"],
-        limit=videos_per_channel,
+        limit=1,
     )
 
-    upload_items = uploads.get(
-        "items",
-        []
-    )
+    upload_items = uploads.get("items", [])
 
     if not upload_items:
         print("No videos found.")
+        return None
 
-        return []
+    video_id = upload_items[0]["contentDetails"]["videoId"]
 
-    video_ids = [
-        item["contentDetails"]["videoId"]
-        for item in upload_items
-    ]
+    details = client.get_videos([video_id])
 
-    details = client.get_videos(
-        video_ids
+    detail_items = details.get("items", [])
+
+    if not detail_items:
+        print(f"Video {video_id} unavailable — skipping.")
+        return None
+
+    video = detail_items[0]
+
+    statistics = video.get("statistics", {})
+    content_details = video.get("contentDetails", {})
+    snippet = video.get("snippet", {})
+
+    duration_seconds = parse_iso_duration(
+        content_details.get("duration", "PT0S")
     )
 
-    details_by_id = {
-        item["id"]: item
-        for item in details.get(
-            "items",
-            []
-        )
+    thumbnail = snippet.get("thumbnails", {}).get("high", {})
+
+    views = int(statistics.get("viewCount", 0))
+    age_hours = hours_since_published(snippet["publishedAt"])
+
+    # Views collected per hour since upload (raw momentum).
+    view_velocity = views / age_hours
+
+    # Same figure normalized by audience size, scaled for readability.
+    # This is the ranking metric: it measures overperformance relative
+    # to the channel's reach, so big channels don't win by default.
+    subscriber_count = max(channel["subscriber_count"], 1)
+    velocity_index = view_velocity / subscriber_count * SUBSCRIBER_SCALE
+
+    video_data = {
+        "video_id": video_id,
+        "channel_id": channel["channel_id"],
+        "channel_name": channel["channel_name"],
+        "subscriber_count": channel["subscriber_count"],
+        "title": snippet.get("title", ""),
+        "published_at": snippet.get("publishedAt", ""),
+        "duration_seconds": duration_seconds,
+        "format": classify_format(
+            duration_seconds,
+            thumbnail_width=thumbnail.get("width"),
+            thumbnail_height=thumbnail.get("height"),
+            title=snippet.get("title", ""),
+            description=snippet.get("description", ""),
+        ),
+        "thumbnail_url": thumbnail.get("url"),
+        "video_url": f"https://www.youtube.com/watch?v={video_id}",
+        "views": views,
+        "likes": int(statistics.get("likeCount", 0)),
+        "comments": int(statistics.get("commentCount", 0)),
+        "age_hours": round(age_hours, 1),
+        "view_velocity": view_velocity,
+        "velocity_index": velocity_index,
     }
 
-    results = []
+    print(
+        f"[{video_data['format']:5}] "
+        f"{video_data['views']:>12,} views | "
+        f"{video_data['title']}"
+    )
 
-    for upload in upload_items:
+    return video_data
 
-        video_id = upload[
-            "contentDetails"
-        ]["videoId"]
 
-        video = details_by_id.get(
-            video_id
-        )
+def print_leaderboard(ranked: list[dict]) -> None:
+    print()
+    print("=" * 100)
+    print("LATEST-UPLOAD VELOCITY RANKING "
+          "(views per hour per million subscribers)")
+    print("=" * 100)
 
-        if video is None:
-            continue
-
-        statistics = video.get(
-            "statistics",
-            {}
-        )
-
-        content_details = video.get(
-            "contentDetails",
-            {}
-        )
-
-        snippet = video.get(
-            "snippet",
-            {}
-        )
-
-        duration = content_details.get(
-            "duration",
-            "PT0S"
-        )
-
-        duration_seconds = (
-            parse_iso_duration(duration)
-        )
-
-        thumbnails = snippet.get(
-            "thumbnails",
-            {}
-        )
-
-        thumbnail = thumbnails.get(
-            "high",
-            {}
-        )
-
-        video_data = {
-            "video_id": video_id,
-
-            "channel_id":
-                channel["channel_id"],
-
-            "channel_name":
-                channel["channel_name"],
-
-            "subscriber_count":
-                channel["subscriber_count"],
-
-            "title":
-                snippet.get(
-                    "title",
-                    ""
-                ),
-
-            "published_at":
-                snippet.get(
-                    "publishedAt",
-                    ""
-                ),
-
-            "duration_seconds":
-                duration_seconds,
-
-            "format":
-                classify_format(
-                    duration_seconds,
-                    thumbnail_width=thumbnail.get("width"),
-                    thumbnail_height=thumbnail.get("height"),
-                    title=snippet.get("title", ""),
-                    description=snippet.get("description", ""),
-                ),
-
-            "thumbnail_url":
-                thumbnail.get("url"),
-
-            "video_url":
-                f"https://www.youtube.com/watch?v={video_id}",
-
-            "views":
-                int(
-                    statistics.get(
-                        "viewCount",
-                        0
-                    )
-                ),
-
-            "likes":
-                int(
-                    statistics.get(
-                        "likeCount",
-                        0
-                    )
-                ),
-
-            "comments":
-                int(
-                    statistics.get(
-                        "commentCount",
-                        0
-                    )
-                ),
-        }
-
-        save_video(
-            connection,
-            video_data
-        )
-
-        save_snapshot(
-            connection,
-            video_data
-        )
-
-        results.append(
-            video_data
-        )
-
+    for rank, v in enumerate(ranked, start=1):
+        flag = " [SHORT]" if v["format"] == "short" else ""
+        marker = "  <-- winner" if rank == 1 else ""
         print(
-            f"[{video_data['format']:5}] "
-            f"{video_data['views']:>12,} views | "
-            f"{video_data['title']}"
+            f"{rank}. {v['channel_name']} ({v['subscriber_count']:,} subs){flag}{marker}\n"
+            f"   {v['views']:>10,} views in {v['age_hours']:>7,.1f} h  |  "
+            f"{v['view_velocity']:>9,.1f} views/hr raw  |  "
+            f"index {v['velocity_index']:>8,.2f}\n"
+            f"   {v['title']}"
         )
-
-    connection.commit()
-
-    return results
 
 
 def main():
@@ -254,137 +164,89 @@ def main():
     config = load_config()
 
     client = YouTubeClient()
-    connection = get_connection()
-    initialize_database(connection)
 
-    all_videos = []
+    videos = []
 
-    try:
-        for channel_url in config["channels"]:
-            videos = process_channel(
-                client=client,
-                connection=connection,
-                channel_url=channel_url,
-                videos_per_channel=config["videos_per_channel"],
-            )
-
-            all_videos.extend(videos)
-
-        connection.commit()
-
-        prune_old_snapshots(connection)
-        vacuum_database(connection)
-
-        # Score only the current run's videos — historical videos would
-        # otherwise skew min-max normalization (old viral videos keep a
-        # high baseline_ratio forever while their velocity decays).
-        metrics = compute_all_metrics(connection, all_videos)
-
-        if not metrics:
+    for channel_url in config["channels"]:
+        try:
+            video = fetch_latest_upload(client, channel_url)
+        except Exception as error:
+            # One bad channel shouldn't kill the whole run.
             print()
-            print("No videos with snapshot data — nothing to score.")
-            return
+            print(f"[error] Skipping {channel_url}: {error}")
+            continue
 
-        metrics = compute_breakout_scores(metrics)
-        llm_client = get_llm_client()
+        if video is not None:
+            videos.append(video)
 
+    if not videos:
         print()
-        print("Running concept analysis (this may take a minute)...")
+        print("No videos collected from any channel.")
+        return
 
+    ranked = sorted(
+        videos,
+        key=lambda v: v["velocity_index"],
+        reverse=True,
+    )
+
+    winner = ranked[0]
+
+    shorts_in_run = [v for v in ranked if v["format"] == "short"]
+
+    if shorts_in_run:
+        names = ", ".join(v["channel_name"] for v in shorts_in_run)
         print()
-        print("Running concept analysis (this may take a minute)...")
-        metrics = analyze_all_concepts(llm_client, connection, metrics)
-
-        print("Detecting cross-channel patterns...")
-        patterns = detect_cross_channel_patterns(llm_client, metrics)
-
-        performance_winner = select_performance_winner(metrics)
-
-        if performance_winner is None:
-            print()
-            print("No winner could be selected — nothing to deliver.")
-            return
-
-        opportunity_winner = select_opportunity_winner(
-            metrics,
-            exclude_video_id=performance_winner["video_id"],
+        print(
+            "[note] Latest upload(s) from these channels are Shorts, which "
+            f"collect views faster than long-form: {names}"
         )
 
+    print_leaderboard(ranked)
+
+    llm_client = get_llm_client()
+
+    print()
+    print("Analyzing winning concept...")
+
+    try:
+        winner = analyze_concepts(llm_client, [winner])[0]
+    except Exception as error:
+        print(f"  [warn] Concept analysis failed: {error}")
+
+    print("Generating optimized title...")
+
+    try:
+        winner = generate_optimized_title(llm_client, winner)
+    except Exception as error:
+        print(f"  [warn] Title generation failed: {error}")
+
+    push_winner_to_trello(winner)
+
+    print()
+    print("=" * 100)
+    print("PERFORMANCE WINNER")
+    print("=" * 100)
+    print(f"{winner['channel_name']} | {winner['title']}")
+    print(
+        f"Velocity index: {winner['velocity_index']:,.2f} | "
+        f"{winner['view_velocity']:,.1f} views/hr | "
+        f"{winner['views']:,} views in {winner['age_hours']:,.1f} h | "
+        f"{winner['video_url']}"
+    )
+    print(f"Format: {winner['format']}")
+
+    optimized_title = winner.get("optimized_title")
+
+    if optimized_title:
         print()
-        print("Generating optimized titles...")
-
-        performance_winner = generate_optimized_title(llm_client, performance_winner)
-
-        if opportunity_winner is not None:
-            opportunity_winner = generate_optimized_title(llm_client, opportunity_winner)
-
-        push_winners_to_trello(performance_winner, opportunity_winner)
-
-        print()
-        print("=" * 100)
-        print("NORMALIZED PERFORMANCE METRICS")
-        print("=" * 100)
-
-        metrics_sorted = sorted(
-            metrics,
-            key=lambda m: m["breakout_score"],
-            reverse=True,
-            )
-
-        for m in metrics_sorted:
-            print(
-                f"score {m['breakout_score']:.3f} | "
-                f"[{m['format']:5}] "
-                f"baseline x{m['baseline_ratio']:>5.2f} | "
-                f"velocity {m['view_velocity']:>8.1f} v/hr | "
-                f"engagement {m['engagement_rate']*100:>5.2f}% | "
-                f"{m['channel_name']} | {m['title'][:60]}"
-                )
-        
-        print()
-        print("=" * 100)
-        print("PERFORMANCE WINNER")
-        print("=" * 100)
-        print(f"{performance_winner['channel_name']} | {performance_winner['title']}")
-        print(f"Score: {performance_winner['breakout_score']} | {performance_winner['video_url']}")
-        print()
-        print(f"  Optimized title: {performance_winner['optimized_title']}")
-        print(f"  Technique: {performance_winner['technique_used']}")
-        print(f"  Why: {performance_winner['title_rationale']}")
-
-        if opportunity_winner is not None:
-            print()
-            print("=" * 100)
-            print("OPPORTUNITY WINNER")
-            print("=" * 100)
-            print(f"{opportunity_winner['channel_name']} | {opportunity_winner['title']}")
-            print(f"Replicability: {opportunity_winner.get('replicability')}/10 | Engagement: {opportunity_winner['engagement_rate']*100:.2f}% | {opportunity_winner['video_url']}")
-            print()
-            print(f"  Optimized title: {opportunity_winner['optimized_title']}")
-            print(f"  Technique: {opportunity_winner['technique_used']}")
-            print(f"  Why: {opportunity_winner['title_rationale']}")
-
-        print()
-        print("=" * 100)
-        print("CROSS-CHANNEL PATTERNS")
-        print("=" * 100)
-
-        if not patterns:
-            print("No clear cross-channel patterns detected.")
-        else:
-            for p in patterns:
-                print(f"\n[{p['strength'].upper()}] {p['pattern_name']}")
-                print(f"  {p['description']}")
-                print(f"  Channels: {', '.join(p['channels_involved'])}")
-                for example in p.get('example_titles', []):
-                    print(f"    - {example}")
-
-    finally:
-        close_connection(connection)
+        print(f"  Optimized title: {optimized_title}")
+        print(f"  Technique: {winner.get('technique_used')}")
+        print(f"  Why: {winner.get('title_rationale')}")
 
     print()
     print("=" * 70)
-    print(f"Collected {len(all_videos)} videos.")
+    print(f"Compared latest uploads from {len(videos)} channels.")
     print("=" * 70)
 
 

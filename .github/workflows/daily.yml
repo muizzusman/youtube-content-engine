@@ -2,7 +2,7 @@ name: Daily YouTube Content Intelligence
 
 on:
   schedule:
-    - cron: "0 20 * * *"  # 7:00 AM UTC = 12:00 PM Lahore time
+    - cron: "0 20 * * *"  # 20:00 UTC daily
   workflow_dispatch:  # allows manual trigger from GitHub's UI
 
 jobs:
@@ -29,11 +29,3 @@ jobs:
           TRELLO_TOKEN: ${{ secrets.TRELLO_TOKEN }}
           TRELLO_LIST_ID: ${{ secrets.TRELLO_LIST_ID }}
         run: python main.py
-
-      - name: Commit updated database
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f data/
-          git diff --staged --quiet || git commit -m "Update database [automated]"
-          git push
